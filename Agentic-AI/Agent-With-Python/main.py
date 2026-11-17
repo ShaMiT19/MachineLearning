@@ -40,6 +40,7 @@ load_dotenv()  # reads ANTHROPIC_API_KEY from a .env file if present
 # so write the docstring as instructions for the model.
 # ---------------------------------------------------------------------------
 
+
 @tool
 def search_wikipedia(query: str) -> str:
     """Search Wikipedia and return a short summary of the best-matching article.
@@ -78,6 +79,7 @@ def save_notes(text: str) -> str:
 # That makes the result easy to use from code.
 # ---------------------------------------------------------------------------
 
+
 class ResearchAnswer(BaseModel):
     topic: str = Field(description="The topic that was researched")
     summary: str = Field(description="A clear answer to the user's question")
@@ -90,7 +92,7 @@ class ResearchAnswer(BaseModel):
 # ---------------------------------------------------------------------------
 
 agent = create_agent(
-    model="anthropic:claude-sonnet-5-5",
+    model="google_genai:gemini-2.5-flash",
     tools=[search_wikipedia, calculator, save_notes],
     system_prompt=(
         "You are a helpful research assistant. "
@@ -104,6 +106,7 @@ agent = create_agent(
 # ---------------------------------------------------------------------------
 # 4. RUN IT
 # ---------------------------------------------------------------------------
+
 
 def main() -> None:
     question = input("What do you want to research? ")

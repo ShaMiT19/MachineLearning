@@ -1,34 +1,36 @@
 """
 The same research agent as main.py, but WITHOUT LangChain.
 
-Here we write the agent loop ourselves using only the Anthropic SDK, so you can
-see exactly what `create_agent` was doing behind the scenes.
+Here we write the agent loop ourselves using only Google's Gemini SDK
+(google-genai), so you can see exactly what `create_agent` was doing behind
+the scenes.
 
 The whole idea fits in a few lines:
 
     messages = [user question]
     while True:
-        response = ask Claude(messages, tools)
-        if Claude didn't ask for a tool:  -> done, print the answer
+        response = ask the model(messages, tools)
+        if the model didn't ask for a tool:  -> done, print the answer
         else: run the tool(s), append the results to messages, loop again
 
 Run it:
     uv run python Agentic-AI/Agent-With-Python/agent_from_scratch.py
-Needs ANTHROPIC_API_KEY in your environment or in a .env file.
+Needs GOOGLE_API_KEY in your environment or in a .env file.
 """
 
 import json
 from datetime import datetime
 
-import anthropic
 import wikipedia
 from dotenv import load_dotenv
+from google import genai
+from google.genai import types
 
 load_dotenv()
 
-client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from the environment
-MODEL = "claude-opus-5-5"
-MAX_TURNS = 10  # safety limit so a confused agent can't loop forever
+client = genai.Client()  # reads GOOGLE_API_KEY from the environment
+MODEL = "gemini-3.7-flash"
+MAX_TURNS = 1  # safety limit so a confused agent can't loop forever
 
 
 # ---------------------------------------------------------------------------
@@ -36,6 +38,7 @@ MAX_TURNS = 10  # safety limit so a confused agent can't loop forever
 # Plain Python. Nothing special about them - Claude never runs these itself.
 # Claude only *asks* us to run them; our loop does the actual calling.
 # ---------------------------------------------------------------------------
+
 
 def search_wikipedia(query: str) -> str:
     try:
@@ -79,7 +82,7 @@ TOOLS = [
     {
         "name": "search_wikipedia",
         "description": "Search Wikipedia and return a short summary of the best-matching "
-                       "article. Use this for facts about people, places, events, and concepts.",
+        "article. Use this for facts about people, places, events, and concepts.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -91,7 +94,7 @@ TOOLS = [
     {
         "name": "calculator",
         "description": "Evaluate a basic arithmetic expression, e.g. '2026 - 1969'. "
-                       "Only numbers and + - * / ( ) . are allowed.",
+        "Only numbers and + - * / ( ) . are allowed.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -103,7 +106,7 @@ TOOLS = [
     {
         "name": "save_notes",
         "description": "Append research notes to research_notes.txt. "
-                       "Only use this when the user asks to save results.",
+        "Only use this when the user asks to save results.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -113,6 +116,21 @@ TOOLS = [
         },
     },
 ]
+
+
+GEMINI_TOOLS = [
+    types.Tool(
+        function_declarations=[
+            types.FunctionDeclaration(
+                name=t["name"],
+                description=t["description"],
+                parameters_json_schema=t["input_schema"],
+            )
+            for t in TOOLS
+        ]
+    )
+]
+
 
 SYSTEM_PROMPT = (
     "You are a helpful research assistant. "
@@ -126,73 +144,72 @@ SYSTEM_PROMPT = (
 # 3. THE AGENT LOOP  <- this is the important part
 # ---------------------------------------------------------------------------
 
+
 def run_agent(question: str) -> str:
+    # Settings that stay the same every turn: system prompt, tools, output limit.
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT,
+        tools=GEMINI_TOOLS,
+        max_output_tokens=16000,
+    )
+
     # The conversation so far. The API is stateless: we resend ALL of it every turn.
-    messages = [{"role": "user", "content": question}]
+    # Gemini calls each message a "Content", made of one or more "Part"s.
+    messages = [types.Content(role="user", parts=[types.Part(text=question)])]
 
     for turn in range(1, MAX_TURNS + 1):
-        print(f"\n--- Turn {turn}: asking Claude ---")
+        print(f"\n--- Turn {turn}: asking Gemini ---")
 
-        # (a) Ask Claude what to do next.
-        #     `fallbacks="default"`: if Claude Opus 5.5 declines a request for safety
-        #     reasons, the API automatically retries it on a fallback model.
-        response = client.beta.messages.create(
+        # (a) Ask Gemini what to do next.
+        response = client.models.generate_content(
             model=MODEL,
-            max_tokens=16000,
-            system=SYSTEM_PROMPT,
-            tools=TOOLS,
-            messages=messages,
-            betas=["server-side-fallback-2026-07-01"],
-            fallbacks="default",
+            contents=messages,
+            config=config,
         )
 
-        # (b) Save Claude's reply into the history. We append the WHOLE content
-        #     list (text + tool calls + thinking), not just the text, so Claude
-        #     remembers exactly what it asked for.
-        messages.append({"role": "assistant", "content": response.content})
+        # No candidates means Gemini blocked the whole prompt (e.g. for safety).
+        if not response.candidates or response.candidates[0].content is None:
+            return f"Gemini returned no answer (finish reason: {response.candidates[0].finish_reason if response.candidates else 'blocked'})."
 
-        # (c) Why did Claude stop talking? This decides what we do next.
-        if response.stop_reason == "end_turn":
-            # No tool requested -> Claude is done. Collect its text and return it.
-            return "".join(b.text for b in response.content if b.type == "text")
+        # (b) Save Gemini's reply into the history. Append the WHOLE Content
+        #     (role="model"), not just the text: it carries hidden "thought
+        #     signatures" that Gemini needs to see again on the next turn.
+        messages.append(response.candidates[0].content)
 
-        if response.stop_reason == "refusal":
-            return "Claude declined to answer this request."
+        # (c) Did Gemini ask for a tool? Gemini has no "tool_use" stop reason -
+        #     finish_reason is STOP either way - so we check for function calls.
+        if not response.function_calls:
+            # No tool requested -> Gemini is done.
+            return response.text or "Gemini finished without any text."
 
-        if response.stop_reason == "max_tokens":
-            return "Ran out of output tokens before finishing."
+        # (d) Gemini asked for one or more tools. Run each one.
+        result_parts = []
+        for call in response.function_calls:
+            args = dict(call.args or {})
+            print(f"[model -> tool] {call.name}({json.dumps(args)})")
 
-        if response.stop_reason != "tool_use":
-            return f"Stopped unexpectedly: {response.stop_reason}"
-
-        # (d) Claude asked for one or more tools. Run each one.
-        tool_results = []
-        for block in response.content:
-            if block.type != "tool_use":
-                continue  # skip text / thinking blocks
-
-            print(f"[model -> tool] {block.name}({json.dumps(block.input)})")
-
-            func = TOOL_FUNCTIONS.get(block.name)
+            func = TOOL_FUNCTIONS.get(call.name)
             if func is None:
-                output, is_error = f"Unknown tool: {block.name}", True
+                output = f"Error: unknown tool '{call.name}'"
             else:
                 try:
-                    output, is_error = func(**block.input), False
+                    output = func(**args)
                 except Exception as e:
-                    output, is_error = f"Tool crashed: {e}", True
+                    output = f"Error: tool crashed: {e}"
 
             print(f"[tool -> model] {output[:150]}...")
 
-            tool_results.append({
-                "type": "tool_result",
-                "tool_use_id": block.id,  # links this result to the request it answers
-                "content": output,
-                "is_error": is_error,     # tells Claude the tool failed so it can adapt
-            })
+            # Gemini wants the result as a dictionary, matched to the call by name.
+            # (There's no is_error flag - an error is just described in the text.)
+            result_parts.append(
+                types.Part.from_function_response(
+                    name=call.name,
+                    response={"result": output},
+                )
+            )
 
-        # (e) Send ALL the results back in ONE user message, then loop again.
-        messages.append({"role": "user", "content": tool_results})
+        # (e) Send ALL the results back in ONE message, then loop again.
+        messages.append(types.Content(role="user", parts=result_parts))
 
     return f"Gave up after {MAX_TURNS} turns."
 
@@ -200,6 +217,7 @@ def run_agent(question: str) -> str:
 # ---------------------------------------------------------------------------
 # 4. RUN IT
 # ---------------------------------------------------------------------------
+
 
 def main() -> None:
     question = input("What do you want to research? ")
